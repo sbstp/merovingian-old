@@ -1,0 +1,13 @@
+[package]
+name = "mero3"
+version = "0.1.0"
+authors = ["Simon <git@sbstp.ca>"]
+
+[dependencies]
+csv = "1"
+failure = "0.1"
+flate2 = "1"
+strsim = "0.7"
+
+[profile.dev]
+debug = false
