@@ -5,12 +5,14 @@ use std::hash::Hash;
 use std::path::Path;
 use std::str::FromStr;
 
+use bincode;
 use csv::ReaderBuilder;
 use failure::Error;
-use flate2::read::GzDecoder;
+use flate2::{read::GzDecoder, write::GzEncoder};
+
 use strsim::levenshtein;
 
-#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
 pub enum TitleKind {
     Movie,
     TvMovie,
@@ -18,7 +20,7 @@ pub enum TitleKind {
     Short,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Title {
     id: u32,
     year: u16,
@@ -82,7 +84,7 @@ macro_rules! some_or_continue {
     };
 }
 
-fn read_titles(path: &str) -> Result<HashMap<u32, Title>, Error> {
+fn read_titles(path: impl AsRef<Path>) -> Result<HashMap<u32, Title>, Error> {
     let file = File::open(path)?;
     let decompressor = GzDecoder::new(file);
     let mut reader = ReaderBuilder::new()
@@ -196,16 +198,52 @@ fn build_reverse_index(titles: &HashMap<u32, Title>) -> HashMap<String, HashSet<
     index
 }
 
+#[derive(Deserialize, Serialize)]
 pub struct Imdb {
     titles: HashMap<u32, Title>,
     index: HashMap<String, HashSet<u32>>,
 }
 
 impl Imdb {
-    pub fn create_index(path: &str) -> Result<Imdb, Error> {
-        let titles = read_titles(path)?;
+    pub fn create_index(path: impl AsRef<Path>) -> Result<Imdb, Error> {
+        let titles = read_titles(path.as_ref())?;
         let index = build_reverse_index(&titles);
         Ok(Imdb { titles, index })
+    }
+
+    pub fn load_index(path: impl AsRef<Path>) -> Result<Imdb, Error> {
+        let file = File::open(path)?;
+        let decompressor = GzDecoder::new(file);
+        let mut imdb: Imdb = bincode::deserialize_from(decompressor)?;
+
+        imdb.titles.shrink_to_fit();
+        imdb.index.shrink_to_fit();
+        imdb.index
+            .values_mut()
+            .for_each(|bucket| bucket.shrink_to_fit());
+
+        Ok(imdb)
+    }
+
+    pub fn load_or_create_index(
+        index_path: impl AsRef<Path>,
+        titles_path: impl AsRef<Path>,
+    ) -> Result<Imdb, Error> {
+        Ok(match Imdb::load_index(index_path.as_ref()) {
+            Ok(imdb) => imdb,
+            Err(_) => {
+                let imdb = Imdb::create_index(titles_path)?;
+                imdb.save(index_path)?;
+                imdb
+            }
+        })
+    }
+
+    pub fn save(&self, path: impl AsRef<Path>) -> Result<(), Error> {
+        let file = File::create(path)?;
+        let compressor = GzEncoder::new(file, Default::default());
+        bincode::serialize_into(compressor, self)?;
+        Ok(())
     }
 
     pub fn lookup(&self, text: &str, year: Option<i32>) -> Option<&Title> {
