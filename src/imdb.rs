@@ -154,7 +154,7 @@ fn tag_splitter(c: char) -> bool {
 
 fn ignored(tag: &str) -> bool {
     match tag {
-        "a" | "an" | "the" | "of" | "in" | "to" | "t" | "s" => true,
+        "a" | "an" | "the" | "of" | "in" | "on" | "to" | "t" | "s" => true,
         _ => false,
     }
 }

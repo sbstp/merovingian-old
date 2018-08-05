@@ -36,7 +36,7 @@ lazy_static! {
     };
 }
 
-fn parse_filename(name: &str) -> Vec<String> {
+pub fn tokenize_filename(name: &str) -> Vec<String> {
     let mut tokens = Vec::new();
     let mut pos = 0;
 
@@ -79,7 +79,7 @@ fn is_year(token: &str) -> bool {
 /// There are also cases where a releases' name shows up before the title, such as '[foobar] The Matrix.mp4',
 /// everything inside square brackets or parens before any normal word is ignored.
 pub fn parse_movie(filename: &str) -> (String, Option<i32>) {
-    let tokens = parse_filename(&filename);
+    let tokens = tokenize_filename(&filename);
 
     let mut year_candidates = vec![];
     let mut first_metadata_token = None;
@@ -128,22 +128,22 @@ fn test_is_year() {
 #[test]
 fn test_split_tokens() {
     assert_eq!(
-        parse_filename("this.file_name-uses:every separator"),
+        tokenize_filename("this.file_name-uses:every separator"),
         vec!["this", "file", "name", "uses", "every", "separator"]
     );
 
-    assert_eq!(parse_filename("foo.-_ .:bar"), vec!["foo", "bar"]);
+    assert_eq!(tokenize_filename("foo.-_ .:bar"), vec!["foo", "bar"]);
 }
 
 #[test]
-fn test_parse_filename_simple() {
-    let tokens = parse_filename("american psycho");
+fn test_tokenize_filename_simple() {
+    let tokens = tokenize_filename("american psycho");
     assert_eq!(tokens, vec!["american", "psycho"]);
 }
 
 #[test]
-fn test_parse_filename_parens_square() {
-    let tokens = parse_filename("American.Psycho.(2000).[1080p]");
+fn test_tokenize_filename_parens_square() {
+    let tokens = tokenize_filename("American.Psycho.(2000).[1080p]");
     assert_eq!(tokens, vec!["american", "psycho", "2000", "1080p"]);
 }
 
