@@ -53,13 +53,19 @@ impl File {
     }
 
     #[inline]
-    pub fn file_name(&self) -> Option<&str> {
-        self.path().file_name().and_then(|p| p.to_str())
+    pub fn name(&self) -> &str {
+        self.path()
+            .file_name()
+            .and_then(|p| p.to_str())
+            .unwrap_or("")
     }
 
     #[inline]
-    pub fn stem(&self) -> Option<&str> {
-        self.path().file_stem().and_then(|p| p.to_str())
+    pub fn stem(&self) -> &str {
+        self.path()
+            .file_stem()
+            .and_then(|p| p.to_str())
+            .unwrap_or("")
     }
 
     #[inline]
@@ -117,6 +123,12 @@ impl File {
             queue: self.get().children.iter().rev().cloned().collect(),
             arena: self.arena.clone(),
         }
+    }
+
+    pub fn name_contains(&self, pattern: &str) -> bool {
+        let pattern = pattern.to_lowercase();
+        let name = self.name().to_lowercase();
+        name.contains(&pattern)
     }
 }
 

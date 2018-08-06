@@ -17,7 +17,9 @@ extern crate yansi;
 mod imdb;
 mod input;
 mod parse;
+mod rename;
 mod scan;
+mod util;
 mod vfs;
 
 use std::io::prelude::*;
@@ -28,7 +30,8 @@ use yansi::Paint;
 
 use imdb::{Imdb, Title};
 use input::Input;
-use scan::{scan_root, ScanEntry};
+use scan::{ScanEntry, Scanner};
+use util::filter_path;
 
 fn lookup<'db>(input: &Input, imdb: &'db Imdb, entry: &mut ScanEntry<'db>) {
     loop {
@@ -54,32 +57,20 @@ fn lookup<'db>(input: &Input, imdb: &'db Imdb, entry: &mut ScanEntry<'db>) {
 
 fn foo() -> Result<(), Error> {
     let imdb = Imdb::load_or_create_index("movies.index.gz", "title.basics.tsv.gz")?;
-    // println!("done");
-
-    // loop {
-    //     let mut line = String::new();
-    //     print!("> ");
-    //     std::io::stdout().flush();
-    //     std::io::stdin().read_line(&mut line)?;
-    //     println!("{} -> {:?}", line, imdb.lookup(line.trim(), None));
-    // }
 
     let input = Input::new();
     let root_path = Path::new("/home/simon/tank/movies/en");
     let root = vfs::walk(&root_path)?;
-    let entries = scan_root(&root, &imdb)?;
-    //println!("{:#?}", entries);
+    let entries = Scanner::new(root, &imdb).scan_root()?;
 
     for entry in entries {
-        let mut renames = vec![&entry.movie];
-        renames.extend(entry.images.iter());
-        renames.extend(entry.subtitles.iter());
+        let renames = rename::movie(&root_path, &entry);
 
         let diff: Vec<_> = renames.iter().filter(|r| r.different()).collect();
 
         if !diff.is_empty() {
             for rename in diff.iter() {
-                println!("Old: {}", Paint::red(rename.file.path().display()));
+                println!("Old: {}", Paint::red(rename.orig.display()));
             }
             for rename in diff.iter() {
                 println!("New: {}", Paint::green(rename.new.display()));
