@@ -56,9 +56,21 @@ fn lookup<'db>(input: &Input, imdb: &'db Imdb, entry: &mut ScanEntry<'db>) {
 }
 
 fn foo() -> Result<(), Error> {
-    let imdb = Imdb::load_or_create_index("movies.index.gz", "title.basics.tsv.gz")?;
+    let imdb = Imdb::load_or_create_index(
+        "movies.index.gz",
+        "title.basics.tsv.gz",
+        "title.ratings.tsv.gz",
+    )?;
 
     let input = Input::new();
+
+    // loop {
+    //     let answer = input.ask_line("lookup something: ");
+    //     let (title, year) = parse::parse_movie(&answer);
+    //     let t = imdb.lookup(&title, year);
+    //     println!("{:?}", t);
+    // }
+
     let root_path = Path::new("/home/simon/tank/movies/en");
     let root = vfs::walk(&root_path)?;
     let entries = Scanner::new(root, &imdb).scan_root()?;

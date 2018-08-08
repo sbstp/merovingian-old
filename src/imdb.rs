@@ -1,7 +1,7 @@
-use std::cmp;
+use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
-use std::hash::Hash;
+use std::hash::{Hash, Hasher};
 use std::path::Path;
 use std::str::FromStr;
 
@@ -9,8 +9,8 @@ use bincode;
 use csv::ReaderBuilder;
 use failure::Error;
 use flate2::{read::GzDecoder, write::GzEncoder};
-
-use strsim::levenshtein;
+use strsim;
+use util::NonNan;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
 pub enum TitleKind {
@@ -28,6 +28,7 @@ pub struct Title {
     primary_title: String,
     original_title: Option<String>,
     kind: TitleKind,
+    votes: u32,
 }
 
 impl Title {
@@ -68,6 +69,25 @@ impl Title {
     }
 }
 
+impl Hash for Title {
+    #[inline]
+    fn hash<H>(&self, hasher: &mut H)
+    where
+        H: Hasher,
+    {
+        self.id.hash(hasher)
+    }
+}
+
+impl PartialEq for Title {
+    #[inline]
+    fn eq(&self, other: &Title) -> bool {
+        self.id == other.id
+    }
+}
+
+impl Eq for Title {}
+
 fn parse_none<T: FromStr>(record: &str) -> Option<T> {
     match record {
         "\\N" => None,
@@ -84,12 +104,43 @@ macro_rules! some_or_continue {
     };
 }
 
-fn read_titles(path: impl AsRef<Path>) -> Result<HashMap<u32, Title>, Error> {
+fn read_votes(path: impl AsRef<Path>) -> Result<HashMap<u32, u32>, Error> {
     let file = File::open(path)?;
     let decompressor = GzDecoder::new(file);
     let mut reader = ReaderBuilder::new()
         .flexible(true)
         .delimiter(b'\t')
+        .quoting(false)
+        .from_reader(decompressor);
+
+    let mut votes_table = HashMap::new();
+
+    for record in reader.records() {
+        let record = record?;
+
+        let id: u32 = record[0][2..].parse()?;
+        //let score = record[1].parse()?;
+        let votes = record[2].parse()?;
+
+        // 50 is a totally arbitrary cutoff for the number of votes
+        if votes >= 50 {
+            votes_table.insert(id, votes);
+        }
+    }
+
+    Ok(votes_table)
+}
+
+fn read_titles(
+    path: impl AsRef<Path>,
+    votes_table: &HashMap<u32, u32>,
+) -> Result<HashMap<u32, Title>, Error> {
+    let file = File::open(path)?;
+    let decompressor = GzDecoder::new(file);
+    let mut reader = ReaderBuilder::new()
+        .flexible(true)
+        .delimiter(b'\t')
+        .quoting(false)
         .from_reader(decompressor);
 
     let mut titles = HashMap::new();
@@ -130,6 +181,11 @@ fn read_titles(path: impl AsRef<Path>) -> Result<HashMap<u32, Title>, Error> {
                 None
             },
             kind,
+            // skip titles with no votes
+            votes: match votes_table.get(&id) {
+                None => continue,
+                Some(votes) => *votes,
+            },
         };
 
         titles.insert(id, title);
@@ -139,15 +195,19 @@ fn read_titles(path: impl AsRef<Path>) -> Result<HashMap<u32, Title>, Error> {
     Ok(titles)
 }
 
+// Tag splitter must be a superset of the filter_path function
 fn tag_splitter(c: char) -> bool {
     match c {
         c if c.is_whitespace() => true,
+        c if c.is_ascii_control() => true,
+        '/' | '<' | '>' | ':' | '"' | '\\' | '|' | '?' | '*' => true, // from filter_path
         '_' => true,
         '-' => true,
         '.' => true,
-        ':' => true,
         ',' => true,
         '\'' => true,
+        '(' => true,
+        ')' => true,
         _ => false,
     }
 }
@@ -167,6 +227,7 @@ fn text_to_tags(text: &str, tags: &mut Vec<String>) {
             tags.push(tag.to_string());
         }
     }
+    tags.dedup();
 }
 
 fn build_reverse_index(titles: &HashMap<u32, Title>) -> HashMap<String, HashSet<u32>> {
@@ -198,6 +259,11 @@ fn build_reverse_index(titles: &HashMap<u32, Title>) -> HashMap<String, HashSet<
     index
 }
 
+struct Match<'t> {
+    score: NonNan,
+    title: &'t Title,
+}
+
 #[derive(Deserialize, Serialize)]
 pub struct Imdb {
     titles: HashMap<u32, Title>,
@@ -205,8 +271,13 @@ pub struct Imdb {
 }
 
 impl Imdb {
-    pub fn create_index(path: impl AsRef<Path>) -> Result<Imdb, Error> {
-        let titles = read_titles(path.as_ref())?;
+    pub fn create_index(
+        titles_path: impl AsRef<Path>,
+        ratings_path: impl AsRef<Path>,
+    ) -> Result<Imdb, Error> {
+        let votes_table = read_votes(ratings_path.as_ref())?;
+        let titles = read_titles(titles_path.as_ref(), &votes_table)?;
+
         let index = build_reverse_index(&titles);
         Ok(Imdb { titles, index })
     }
@@ -228,11 +299,12 @@ impl Imdb {
     pub fn load_or_create_index(
         index_path: impl AsRef<Path>,
         titles_path: impl AsRef<Path>,
+        ratings_path: impl AsRef<Path>,
     ) -> Result<Imdb, Error> {
         Ok(match Imdb::load_index(index_path.as_ref()) {
             Ok(imdb) => imdb,
             Err(_) => {
-                let imdb = Imdb::create_index(titles_path)?;
+                let imdb = Imdb::create_index(titles_path, ratings_path)?;
                 imdb.save(index_path)?;
                 imdb
             }
@@ -250,71 +322,68 @@ impl Imdb {
         let mut tags = Vec::new();
         text_to_tags(&text, &mut tags);
 
-        // find the titles that matched the most tags
-        let mut titles: Counter<u32> = Counter::new();
+        let scoring_func = |title: &Title| -> NonNan {
+            let mut score = match title.original_title() {
+                None => strsim::jaro(&title.primary_title().to_lowercase(), text),
+                Some(original_title) => f64::max(
+                    strsim::jaro(&title.primary_title().to_lowercase(), text),
+                    strsim::jaro(&original_title.to_lowercase(), text),
+                ),
+            };
 
-        for tag in tags.into_iter() {
-            if let Some(index_titles) = self.index.get(&tag) {
-                for index_title in index_titles {
-                    titles.add(*index_title);
-                }
-            }
-        }
+            score *= match title.kind() {
+                TitleKind::Movie => 1.0,
+                _ => 0.80,
+            };
 
-        let mut most_common = titles.most_common();
-
-        // filter on year when possible
-        if let Some(year) = year {
-            most_common.retain(|&index| {
-                let t = &self.titles[index];
-                if let Some(title_year) = t.year() {
-                    if (title_year - year).abs() > 1 {
-                        return false;
-                    }
-                }
-                true
-            });
-        }
-
-        let diff = |title: &Title| {
-            let primary_lev = levenshtein(&title.primary_title, text);
-            if let Some(original_title) = &title.original_title {
-                cmp::min(primary_lev, levenshtein(&original_title, text))
-            } else {
-                primary_lev
-            }
+            NonNan::new(score)
         };
 
-        // find the best matches from the pool of candidates
-        let mut best_matches = Vec::new();
-        let mut best_match = None;
+        let mut counter = Counter::new();
 
-        for candidate in most_common {
-            let title = &self.titles[candidate];
-            let d = diff(title);
-            match best_match {
-                None => {
-                    best_match = Some(d);
-                    best_matches.push(title);
+        for tag in tags.into_iter() {
+            if let Some(title_ids) = self.index.get(&tag) {
+                for title_id in title_ids.iter() {
+                    let title = &self.titles[title_id];
+
+                    // If we have year information, only keep titles whose year is within one of the target year.
+                    if let (Some(year), Some(title_year)) = (year, title.year()) {
+                        if (year - title_year).abs() > 1 {
+                            continue;
+                        }
+                    }
+
+                    counter.add(title);
                 }
-                Some(bm) if d == bm => {
-                    best_matches.push(title);
-                }
-                Some(bm) if d < bm => {
-                    best_match = Some(d);
-                    best_matches.clear();
-                    best_matches.push(title);
-                }
-                _ => {}
             }
         }
 
-        // pick the best kind from the best matches
-        best_matches.sort_by(|left, right| left.kind().cmp(&right.kind()));
-        best_matches.into_iter().next()
+        let mut matches: Vec<_> = counter
+            .most_common()
+            .into_iter()
+            .map(|title| Match {
+                score: scoring_func(title),
+                title,
+            }).collect();
+
+        // sort by score descending
+        matches.sort_by_key(|m| Reverse(m.score));
+
+        // this step uses popularity, the best matches with 1% error margin are sorted by popularity
+        let mut iterator = matches.into_iter();
+        if let Some(best) = iterator.next() {
+            let mut candidates = vec![];
+            candidates.extend(iterator.take_while(|m| (*best.score - *m.score).abs() <= 0.01));
+            candidates.push(best);
+            candidates.sort_by_key(|m| Reverse(m.title.votes));
+            candidates.into_iter().map(|m| m.title).next()
+        } else {
+            None
+        }
     }
 }
 
+#[derive(Debug)]
 struct Counter<K: Hash + Eq> {
     inner: HashMap<K, u32>,
 }
