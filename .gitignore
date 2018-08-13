@@ -1,2 +1,5 @@
-/target
+target/
+ffprobe/Cargo.lock
+imdb/Cargo.lock
 **/*.rs.bk
+.merovingian

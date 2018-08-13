@@ -4,16 +4,15 @@ version = "0.1.0"
 authors = ["Simon <git@sbstp.ca>"]
 
 [dependencies]
-bincode = "1"
-csv = "1"
 failure = "0.1"
-flate2 = "1"
 lazy_static = "1"
 maplit = "1"
-serde = "1"
-serde_derive = "1"
-strsim = "0.7"
+same-file = "1"
+structopt = "0.2"
 yansi = "0.4"
+
+ffprobe = { path = "ffprobe" }
+imdb = { path = "imdb" }
 
 [profile.dev]
 debug = false

@@ -1,20 +1,19 @@
 #![feature(nll)]
 
-extern crate bincode;
-extern crate csv;
+#[macro_use]
 extern crate failure;
-extern crate flate2;
 #[macro_use]
 extern crate lazy_static;
 #[macro_use]
 extern crate maplit;
-extern crate serde;
+extern crate same_file;
 #[macro_use]
-extern crate serde_derive;
-extern crate strsim;
+extern crate structopt;
 extern crate yansi;
 
-mod imdb;
+extern crate ffprobe;
+extern crate imdb;
+
 mod input;
 mod parse;
 mod rename;
@@ -22,107 +21,107 @@ mod scan;
 mod util;
 mod vfs;
 
-use std::io::prelude::*;
-use std::path::{Path, PathBuf};
+use std::fs;
 
 use failure::Error;
+use structopt::StructOpt;
 use yansi::Paint;
 
-use imdb::{Imdb, Title};
-use input::Input;
-use scan::{ScanEntry, Scanner};
-use util::filter_path;
+use imdb::Imdb;
+use rename::{Cleaner, Renames};
+use scan::Scanner;
+use util::format_runtime;
 
-fn lookup<'db>(input: &Input, imdb: &'db Imdb, entry: &mut ScanEntry<'db>) {
-    loop {
-        let fullname = input.ask_line("What movie is it?");
-        let (name, year) = parse::parse_movie(&fullname);
-        if let Some(title) = imdb.lookup(&name, year) {
-            if input.confirm(
-                &format!(
-                    "Found '{} ({})', is this it?",
-                    title.primary_title(),
-                    title.year().unwrap()
-                ),
-                None,
-            ) {
-                entry.title = title;
-                break;
-            }
-        } else {
-            println!("Found nothing.");
-        }
-    }
+#[derive(Debug, StructOpt)]
+struct App {
+    /// Path to the directory containing movies.
+    path: Option<String>,
+    /// Apply the changes.
+    #[structopt(short = "a", long = "--apply")]
+    apply: bool,
 }
 
 fn foo() -> Result<(), Error> {
-    let imdb = Imdb::load_or_create_index(
-        "movies.index.gz",
-        "title.basics.tsv.gz",
-        "title.ratings.tsv.gz",
-    )?;
+    let args = App::from_args();
 
-    let input = Input::new();
+    let imdb = Imdb::load_or_create_index(".merovingian")?;
 
-    // loop {
-    //     let answer = input.ask_line("lookup something: ");
-    //     let (title, year) = parse::parse_movie(&answer);
-    //     let t = imdb.lookup(&title, year);
-    //     println!("{:?}", t);
-    // }
+    println!("Index contains {} titles.", imdb.len());
+    println!("Scanning folder...");
 
-    let root_path = Path::new("/home/simon/tank/movies/en");
+    let root_path = fs::canonicalize(args.path.as_ref().map(|s| s.as_str()).unwrap_or("."))
+        .expect("unable to canonicalize root path");
     let root = vfs::walk(&root_path)?;
-    let entries = Scanner::new(root, &imdb).scan_root()?;
+    let mut entries = Scanner::new(&root, &imdb).scan_root()?;
+    let mut cleaner = Cleaner::new();
 
-    for entry in entries {
-        let renames = rename::movie(&root_path, &entry);
+    println!("Scan found {} movies.", entries.len());
+    println!();
 
-        let diff: Vec<_> = renames.iter().filter(|r| r.different()).collect();
+    for entry in entries.iter_mut() {
+        cleaner.mark(&entry);
+        let renames = Renames::new(&root_path, &entry);
 
-        if !diff.is_empty() {
-            for rename in diff.iter() {
-                println!("Old: {}", Paint::red(rename.orig.display()));
+        if !renames.is_empty() {
+            println!("\tFile: {}", Paint::yellow(entry.movie.name()));
+            println!(
+                "\tMatch: {} ({}) | {}",
+                Paint::yellow(format!(
+                    "{} ({})",
+                    entry.title.primary_title(),
+                    entry.title.year()
+                )).underline(),
+                format_runtime(entry.title.runtime()),
+                Paint::new(format!("https://imdb.com/title/tt{:07}/", entry.title.id()))
+                    .underline(),
+            );
+
+            println!();
+
+            for rename in renames.iter() {
+                println!(
+                    "{}",
+                    Paint::red(rename.orig().strip_prefix(&root_path).unwrap().display())
+                );
             }
-            for rename in diff.iter() {
-                println!("New: {}", Paint::green(rename.new.display()));
+            for rename in renames.iter() {
+                println!(
+                    "{}",
+                    Paint::green(rename.renamed().strip_prefix(&root_path).unwrap().display())
+                );
+            }
+
+            if args.apply {
+                if let Err(err) = renames.apply() {
+                    println!("=> Could not rename movie: {}", err);
+                }
             }
 
             println!();
         }
+    }
 
-        // if entry.movie.file.path() != entry.movie.new {
-        //     println!("Old: {}", Paint::red(entry.movie.file.path().display()));
-        //     println!("New: {}", Paint::green(entry.movie.new.display()));
-        //     // let choice = input.select(
-        //     //     "What do with this?",
-        //     //     [
-        //     //         ("a", "accept"),
-        //     //         ("s", "skip"),
-        //     //         ("l", "lookup"),
-        //     //         ("d", "delete"),
-        //     //     ],
-        //     //     Some("a"),
-        //     // );
+    println!("Files that will be removed:");
 
-        //     // match choice {
-        //     //     "a" => {
-        //     //         println!("Accepted...");
-        //     //     }
-        //     //     "s" => {
-        //     //         println!("Skipping...");
-        //     //     }
-        //     //     "l" => {
-        //     //         lookup(&input, &imdb, &mut entry);
-        //     //     }
-        //     //     "d" => {
-        //     //         println!("Deleting...");
-        //     //     }
-        //     //     _ => unreachable!(),
-        //     // }
+    for file in root.descendants() {
+        if file.is_file() && !cleaner.is_marked(&file) {
+            println!("{}", Paint::red(file.path().display()));
+            if args.apply {
+                if let Err(err) = fs::remove_file(file.path()) {
+                    println!("=> Could not remove {}: {}", file.path().display(), err);
+                }
+            }
+        }
+    }
 
-        //     println!();
-        // }
+    // Remove all the empty directories.
+    if args.apply {
+        for file in root.descendants() {
+            if file.is_dir() {
+                //println!("Trying to remove {}", file.path().display());
+                let _ = fs::remove_dir(file.path());
+            }
+        }
     }
 
     Ok(())

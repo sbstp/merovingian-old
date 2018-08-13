@@ -1,92 +1,18 @@
 use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
-use std::fs::File;
-use std::hash::{Hash, Hasher};
+use std::fs::{DirBuilder, File};
 use std::path::Path;
 use std::str::FromStr;
 
 use bincode;
 use csv::ReaderBuilder;
-use failure::Error;
 use flate2::{read::GzDecoder, write::GzEncoder};
+use reqwest::Client;
 use strsim;
-use util::NonNan;
 
-#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
-pub enum TitleKind {
-    Movie,
-    TvMovie,
-    Video,
-    Short,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct Title {
-    id: u32,
-    year: u16,
-    runtime: u16,
-    primary_title: String,
-    original_title: Option<String>,
-    kind: TitleKind,
-    votes: u32,
-}
-
-impl Title {
-    #[inline]
-    pub fn id(&self) -> u32 {
-        self.id
-    }
-
-    #[inline]
-    pub fn year(&self) -> Option<i32> {
-        match self.year {
-            0 => None,
-            year => Some(year as i32),
-        }
-    }
-
-    #[inline]
-    pub fn runtime(&self) -> Option<i32> {
-        match self.year {
-            0 => None,
-            year => Some(year as i32),
-        }
-    }
-
-    #[inline]
-    pub fn primary_title(&self) -> &str {
-        &self.primary_title
-    }
-
-    #[inline]
-    pub fn original_title(&self) -> Option<&str> {
-        self.original_title.as_ref().map(|s| s.as_str())
-    }
-
-    #[inline]
-    pub fn kind(&self) -> TitleKind {
-        self.kind
-    }
-}
-
-impl Hash for Title {
-    #[inline]
-    fn hash<H>(&self, hasher: &mut H)
-    where
-        H: Hasher,
-    {
-        self.id.hash(hasher)
-    }
-}
-
-impl PartialEq for Title {
-    #[inline]
-    fn eq(&self, other: &Title) -> bool {
-        self.id == other.id
-    }
-}
-
-impl Eq for Title {}
+use error::Result;
+use title::{Title, TitleKind};
+use util::{Counter, NonNan};
 
 fn parse_none<T: FromStr>(record: &str) -> Option<T> {
     match record {
@@ -104,7 +30,7 @@ macro_rules! some_or_continue {
     };
 }
 
-fn read_votes(path: impl AsRef<Path>) -> Result<HashMap<u32, u32>, Error> {
+fn read_votes(path: impl AsRef<Path>) -> Result<HashMap<u32, u32>> {
     let file = File::open(path)?;
     let decompressor = GzDecoder::new(file);
     let mut reader = ReaderBuilder::new()
@@ -134,7 +60,7 @@ fn read_votes(path: impl AsRef<Path>) -> Result<HashMap<u32, u32>, Error> {
 fn read_titles(
     path: impl AsRef<Path>,
     votes_table: &HashMap<u32, u32>,
-) -> Result<HashMap<u32, Title>, Error> {
+) -> Result<HashMap<u32, Title>> {
     let file = File::open(path)?;
     let decompressor = GzDecoder::new(file);
     let mut reader = ReaderBuilder::new()
@@ -165,6 +91,10 @@ fn read_titles(
 
         let year = some_or_continue!(parse_none(&record[5]));
         let runtime = some_or_continue!(parse_none(&record[7]));
+
+        if year == 0 || runtime == 0 {
+            continue;
+        }
 
         let id = record[0][2..].parse()?;
         let primary_title = &record[2];
@@ -241,13 +171,13 @@ fn build_reverse_index(titles: &HashMap<u32, Title>) -> HashMap<String, HashSet<
                 index
                     .entry(tag)
                     .or_insert_with(|| HashSet::new())
-                    .insert(title.id);
+                    .insert(title.id());
             }
         };
 
-        index_title(&title.primary_title);
-        if let Some(original_title) = &title.original_title {
-            if &title.primary_title != original_title {
+        index_title(title.primary_title());
+        if let Some(original_title) = title.original_title() {
+            if title.primary_title() != original_title {
                 index_title(&original_title);
             }
         }
@@ -257,6 +187,41 @@ fn build_reverse_index(titles: &HashMap<u32, Title>) -> HashMap<String, HashSet<
     index.values_mut().for_each(|bucket| bucket.shrink_to_fit());
 
     index
+}
+
+fn download_file(client: &Client, url: &str, dest: impl AsRef<Path>) -> Result<()> {
+    let mut file = File::create(dest)?;
+    let mut resp = client.get(url).send()?;
+    resp.copy_to(&mut file)?;
+    Ok(())
+}
+
+fn download_file_if_missing(client: &Client, url: &str, dest: impl AsRef<Path>) -> Result<()> {
+    if !dest.as_ref().exists() {
+        download_file(client, url, dest)?;
+    }
+    Ok(())
+}
+
+const SRC_FILE_BASICS: &str = "title.basics.tsv.gz";
+const SRC_FILE_RATINGS: &str = "title.ratings.tsv.gz";
+
+fn check_source_files(index_dir: &Path) -> Result<()> {
+    let client = Client::new();
+
+    download_file_if_missing(
+        &client,
+        "https://datasets.imdbws.com/title.basics.tsv.gz",
+        index_dir.join(SRC_FILE_BASICS),
+    )?;
+
+    download_file_if_missing(
+        &client,
+        "https://datasets.imdbws.com/title.ratings.tsv.gz",
+        index_dir.join(SRC_FILE_RATINGS),
+    )?;
+
+    Ok(())
 }
 
 struct Match<'t> {
@@ -271,18 +236,15 @@ pub struct Imdb {
 }
 
 impl Imdb {
-    pub fn create_index(
-        titles_path: impl AsRef<Path>,
-        ratings_path: impl AsRef<Path>,
-    ) -> Result<Imdb, Error> {
-        let votes_table = read_votes(ratings_path.as_ref())?;
-        let titles = read_titles(titles_path.as_ref(), &votes_table)?;
+    pub fn create_index(index_dir: &Path) -> Result<Imdb> {
+        let votes_table = read_votes(index_dir.join(SRC_FILE_RATINGS))?;
+        let titles = read_titles(index_dir.join(SRC_FILE_BASICS), &votes_table)?;
 
         let index = build_reverse_index(&titles);
         Ok(Imdb { titles, index })
     }
 
-    pub fn load_index(path: impl AsRef<Path>) -> Result<Imdb, Error> {
+    pub fn load_index(path: impl AsRef<Path>) -> Result<Imdb> {
         let file = File::open(path)?;
         let decompressor = GzDecoder::new(file);
         let mut imdb: Imdb = bincode::deserialize_from(decompressor)?;
@@ -296,22 +258,24 @@ impl Imdb {
         Ok(imdb)
     }
 
-    pub fn load_or_create_index(
-        index_path: impl AsRef<Path>,
-        titles_path: impl AsRef<Path>,
-        ratings_path: impl AsRef<Path>,
-    ) -> Result<Imdb, Error> {
-        Ok(match Imdb::load_index(index_path.as_ref()) {
+    pub fn load_or_create_index(index_dir: impl AsRef<Path>) -> Result<Imdb> {
+        let index_dir = index_dir.as_ref();
+        let index_path = index_dir.join("index.gz");
+
+        DirBuilder::new().recursive(true).create(index_dir)?;
+        check_source_files(index_dir)?;
+
+        Ok(match Imdb::load_index(&index_path) {
             Ok(imdb) => imdb,
             Err(_) => {
-                let imdb = Imdb::create_index(titles_path, ratings_path)?;
-                imdb.save(index_path)?;
+                let imdb = Imdb::create_index(index_dir)?;
+                imdb.save(&index_path)?;
                 imdb
             }
         })
     }
 
-    pub fn save(&self, path: impl AsRef<Path>) -> Result<(), Error> {
+    pub fn save(&self, path: impl AsRef<Path>) -> Result<()> {
         let file = File::create(path)?;
         let compressor = GzEncoder::new(file, Default::default());
         bincode::serialize_into(compressor, self)?;
@@ -331,6 +295,12 @@ impl Imdb {
                 ),
             };
 
+            if let Some(year) = year {
+                if title.year() != year {
+                    score *= 0.85;
+                }
+            }
+
             score *= match title.kind() {
                 TitleKind::Movie => 1.0,
                 _ => 0.80,
@@ -347,8 +317,8 @@ impl Imdb {
                     let title = &self.titles[title_id];
 
                     // If we have year information, only keep titles whose year is within one of the target year.
-                    if let (Some(year), Some(title_year)) = (year, title.year()) {
-                        if (year - title_year).abs() > 1 {
+                    if let Some(year) = year {
+                        if (year - title.year()).abs() > 1 {
                             continue;
                         }
                     }
@@ -375,56 +345,14 @@ impl Imdb {
             let mut candidates = vec![];
             candidates.extend(iterator.take_while(|m| (*best.score - *m.score).abs() <= 0.01));
             candidates.push(best);
-            candidates.sort_by_key(|m| Reverse(m.title.votes));
+            candidates.sort_by_key(|m| Reverse(m.title.votes()));
             candidates.into_iter().map(|m| m.title).next()
         } else {
             None
         }
     }
-}
 
-#[derive(Debug)]
-struct Counter<K: Hash + Eq> {
-    inner: HashMap<K, u32>,
-}
-
-impl<K> Counter<K>
-where
-    K: Hash + Eq,
-{
-    pub fn new() -> Counter<K> {
-        Counter {
-            inner: HashMap::new(),
-        }
+    pub fn len(&self) -> usize {
+        self.titles.len()
     }
-
-    pub fn add(&mut self, key: K) {
-        *self.inner.entry(key).or_insert(0) += 1;
-    }
-
-    pub fn most_common(&self) -> Vec<&K> {
-        let mut most_common = Vec::new();
-        let mut most_count = 0;
-        for (key, &count) in self.inner.iter() {
-            if count == most_count {
-                most_common.push(key);
-            } else if count >= most_count {
-                most_common.clear();
-                most_common.push(key);
-                most_count = count;
-            }
-        }
-        most_common
-    }
-}
-
-#[test]
-fn test_most_common() {
-    let mut c = Counter::new();
-    c.add("hello");
-    assert_eq!(c.most_common(), vec![&"hello"]);
-    c.add("hey");
-    assert_eq!(c.most_common().len(), 2);
-    c.add("hello");
-    assert_eq!(c.most_common(), vec![&"hello"]);
 }

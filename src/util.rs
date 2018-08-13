@@ -26,32 +26,8 @@ impl PathExt for Path {
     }
 }
 
-#[derive(Copy, Clone, Debug, PartialEq, PartialOrd)]
-pub struct NonNan(f64);
-
-impl NonNan {
-    pub fn new(val: f64) -> NonNan {
-        if val.is_nan() {
-            panic!("NonNan created with NaN value");
-        }
-        NonNan(val)
-    }
-}
-
-impl Eq for NonNan {}
-
-impl Ord for NonNan {
-    #[inline]
-    fn cmp(&self, other: &NonNan) -> Ordering {
-        self.partial_cmp(other).unwrap()
-    }
-}
-
-impl Deref for NonNan {
-    type Target = f64;
-
-    #[inline]
-    fn deref(&self) -> &f64 {
-        &self.0
-    }
+pub fn format_runtime(runtime: i32) -> String {
+    let hours = runtime / 60;
+    let minutes = runtime % 60;
+    format!("{}h {:02}m", hours, minutes)
 }

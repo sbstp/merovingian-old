@@ -80,9 +80,9 @@ pub struct Scanner<'i> {
 }
 
 impl<'i> Scanner<'i> {
-    pub fn new(root: File, imdb: &Imdb) -> Scanner {
+    pub fn new(root: &File, imdb: &'i Imdb) -> Scanner<'i> {
         Scanner {
-            root,
+            root: root.clone(),
             imdb,
             is_flagged_cache: HashMap::new(),
             is_movie_cache: HashMap::new(),

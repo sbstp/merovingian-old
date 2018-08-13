@@ -1,0 +1,16 @@
+[package]
+name = "imdb"
+version = "0.1.0"
+authors = ["Simon <git@sbstp.ca>"]
+
+[dependencies]
+bincode = "1"
+csv = "1"
+flate2 = "1"
+reqwest = "0.8"
+serde = "1"
+serde_derive = "1"
+strsim = "0.7"
+
+[profile.dev]
+debug = false
